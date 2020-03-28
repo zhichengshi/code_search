@@ -24,8 +24,9 @@ def seq2id(desc, vocab):
     desc_tokens = []
     for token in tokens:
         desc_tokens += split_token(token)
+    
 
-    return [vocab[token].index for token in desc_tokens]
+    return [vocab[token].index for token in desc_tokens if token in vocab]
 
 
 def xml2astSeq(xml, vocab, language):  # 完成的代码预处理过程，源码 =>> 子树序列（子树接节点为index）
@@ -70,9 +71,9 @@ def xml2astSeq(xml, vocab, language):  # 完成的代码预处理过程，源码
 
     # 将ast中的节点以索引数字替代
     def tree_to_index(node, vocab):
-        max_index = len(vocab)
         token = node.tag
-        result = [vocab[token].index if token in vocab else max_index]
+        if token in vocab:
+            result=[vocab[token].index]
         children = node.getchildren()
         for child in children:
             result.append(tree_to_index(child, vocab))

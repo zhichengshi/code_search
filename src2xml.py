@@ -8,7 +8,7 @@ import signal
 
 def set_timeout(timeout):
     def wrap(func):
-        def handle(signum, frame):  # 收到信号 SIGALRM 后的回调函数，第一个参数是信号的数字，第二个参数是the interrupted stack frame.
+        def handle(signum, frame):  
             raise RuntimeError
 
         def to_do(*args):
@@ -55,8 +55,6 @@ class src2xml():
         df['xml'] = xmls
         df['description'] = descs
 
-
-
         #dump data
         dump_path = os.path.join(self.root, self.language, 'xml', self.part+".json")
         df.to_json(dump_path)
@@ -64,6 +62,7 @@ class src2xml():
 if __name__ == "__main__":
     root='dataset'
     language='C#'
-    part='temp'
+    part='test'
     procedure=src2xml(root,language,part)
     procedure.transform()
+    

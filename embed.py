@@ -17,7 +17,7 @@ def fastText(corpus):
     from configparser import ConfigParser
     cp = ConfigParser()
     cp.read('config.ini')
-    size = int(cp.get('fastText', 'size'))
+    size = int(cp.get('model', 'embed_size'))
     window = int(cp.get('fastText', 'window'))
 
     print("training fastText model")

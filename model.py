@@ -4,9 +4,9 @@ import torch
 from torch.autograd import Variable
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import numpy as np
+
+
 # 递归神经网络对树编码
-
-
 class BatchTreeEncoder(nn.Module):
     def __init__(self, vocab_size, embedding_dim, encode_dim, batch_size, use_gpu, pretrained_weight=None):
         super(BatchTreeEncoder, self).__init__()
@@ -105,11 +105,11 @@ class TreeEncoder(nn.Module):
         self.dropout = nn.Dropout(0.2)
 
     def init_hidden(self):
-        if self.gpu is True:
+        if self.gpu:
             if isinstance(self.biRnn, nn.LSTM):
-                h0 = Variable(torch.zeros(self.num_layers * 2, self.batch_size, self.hidden_dim).cuda())
+                h0 = Variable(torch.zeros(self.num_layers * 2, self.batch_size,  self.hidden_dim).cuda())
                 c0 = Variable(torch.zeros(self.num_layers * 2, self.batch_size, self.hidden_dim).cuda())
-                return h0, c0
+                return (h0, c0)
             return Variable(torch.zeros(self.num_layers * 2, self.batch_size, self.hidden_dim)).cuda()
         else:
             return Variable(torch.zeros(self.num_layers * 2, self.batch_size, self.hidden_dim))
@@ -149,7 +149,7 @@ class TreeEncoder(nn.Module):
 
 
 class SeqEncoder(nn.Module):
-    def __init__(self, vocab_size, emb_size, rnn_hidden_size, voc_pretrained_weight=None, n_layers=1):
+    def __init__(self, vocab_size, emb_size, rnn_hidden_size, voc_pretrained_weight=None, use_gpu=1, n_layers=1):
         super(SeqEncoder, self).__init__()
         self.emb_size = emb_size
         self.hidden_size = rnn_hidden_size
@@ -157,29 +157,22 @@ class SeqEncoder(nn.Module):
         self.embedding = nn.Embedding(vocab_size, emb_size, padding_idx=0)
         self.lstm = nn.LSTM(emb_size, rnn_hidden_size, batch_first=True, bidirectional=True)
         self.voc_pretrained_weight = voc_pretrained_weight
+        self.th = torch.cuda if use_gpu else torch
+
         self.init_weights()
 
     def init_weights(self):
-        if self.voc_pretrained_weight != None:
-            self.embedding.weight.data.copy_(torch.from_numpy(self.voc_pretrained_weight))
-        else:
-            nn.init.uniform_(self.embedding.weight, -0.1, 0.1)
-            nn.init.constant_(self.embedding.weight[0], 0)
-
+        self.embedding.weight.data.copy_(torch.from_numpy(self.voc_pretrained_weight))
+        self.embedding.weight.requires_grad = True
         for name, param in self.lstm.named_parameters():  # initialize the gate weights
-            # adopted from https://gist.github.com/jeasinema/ed9236ce743c8efaf30fa2ff732749f5
-            # if len(param.shape)>1:
-            #    weight_init.orthogonal_(param.data)
-            # else:
-            #    weight_init.normal_(param.data)
-            # adopted from fairseq
             if 'weight' in name or 'bias' in name:
                 param.data.uniform_(-0.1, 0.1)
 
     def forward(self, inputs, input_lens=None):
-        batch_size, seq_len = inputs.size()
-        inputs = self.embedding(inputs)  # input: [batch_sz x seq_len]  embedded: [batch_sz x seq_len x emb_sz]
+        (batch_size, seq_len) = inputs.shape
+        inputs = self.embedding(Variable(self.th.LongTensor(inputs)).cuda())  # input: [batch_sz x seq_len]  embedded: [batch_sz x seq_len x emb_sz]
         inputs = F.dropout(inputs, 0.25, self.training)
+        input_lens = Variable(self.th.LongTensor(input_lens)).cuda()
 
         if input_lens is not None:  # sort and pack sequence
             input_lens_sorted, indices = input_lens.sort(descending=True)
@@ -197,25 +190,29 @@ class SeqEncoder(nn.Module):
         return output   # bach_size, seq_len,  n_dirs * hidden_size
 
 # 带有atten的整个network
-class JointEncoderWithAttention(nn.Module):
-    def __init__(self, config):
-        super(JointEncoderWithAttention, self).__init__()
-        self.config = config
 
+
+class JointEncoderWithAttention(nn.Module):
+    def __init__(self, batch_size, embed_size, use_gpu, rnn_hidden_size, tree_embed_size,
+                 code_ast_repr_size, code_token_repr_size, code_combine_repr_size, desc_repr_size, vocab_size, pretrained_weight, margin,sim_measure='cos'):
+        super(JointEncoderWithAttention, self).__init__()
+
+        self.sim_measure = sim_measure
+        self.margin=margin
         # 基于树以及线性结构的网络
-        self.tree_encoder = TreeEncoder(config['embed_size'], config['rnn_hidden_size'], config['vocab_size'], config['tree_embed_size'], config['batch_size'])
-        self.seq_encoder = SeqEncoder(config['vocab_size'], config['embed_size'], config['rnn_hidden_size'])
+        self.tree_encoder = TreeEncoder(embed_size, rnn_hidden_size, vocab_size, tree_embed_size, batch_size, use_gpu, pretrained_weight)
+        self.seq_encoder = SeqEncoder(vocab_size, embed_size, rnn_hidden_size, pretrained_weight)
 
         # 不同网络的线性映射
-        self.tree_linear = nn.Linear(2*config['rnn_hidden_size'], config['repr_size'])
-        self.token_linear = nn.Linear(2*config['rnn_hidden_size'], config['repr_size'])
-        self.combine_linear=nn.Linear(2*config['repr_size'],config['repr_size'])
-        self.desc_linear = nn.Linear(2*config['rnn_hidden_size'], config['repr_size'])
+        self.tree_linear = nn.Linear(2*rnn_hidden_size, code_ast_repr_size)
+        self.token_linear = nn.Linear(2*rnn_hidden_size, code_token_repr_size)
+        self.combine_linear = nn.Linear(code_ast_repr_size+code_token_repr_size, code_combine_repr_size)
+        self.desc_linear = nn.Linear(2*rnn_hidden_size, desc_repr_size)
 
         # 标准正态分布初始化attention变量
-        self.tree_attn_param = nn.Parameter(torch.randn(config['repr_size']))
-        self.token_attn_param = nn.Parameter(torch.randn(config['repr_size']))
-        self.desc_attn_param = nn.Parameter(torch.randn(config['repr_size']))
+        self.tree_attn_param = nn.Parameter(torch.randn(code_ast_repr_size))
+        self.token_attn_param = nn.Parameter(torch.randn(code_token_repr_size))
+        self.desc_attn_param = nn.Parameter(torch.randn(desc_repr_size))
 
     # 初始化模型参数
     def init_weights(self):
@@ -224,117 +221,96 @@ class JointEncoderWithAttention(nn.Module):
             nn.init.constant_(linear.bias, 0.)
 
     # 对code部分进行编码
-    def code_encode(self, tokens, token_len, token_mask, asts, ast_mask):
-        batch_size=tokens.size(0)
+    def code_encode(self, tokens, token_len, asts, ast_len):
+        batch_size = tokens.shape[0]
+        token_mask=self.create_mask(token_len)
+        ast_mask=self.create_mask(ast_len)
         # 处理code_token
         token_rnn_output = self.token_linear(self.seq_encoder(tokens, token_len)).permute(0, 2, 1)  # (batch_size,repr_size,max_len)
-        token_attn_param = self.token_attn_param.repeat(batch_size).unsqueeze(1)  # (batch_size,1,repr_size)
+        token_attn_param = self.token_attn_param.repeat(batch_size, 1).unsqueeze(1)  # (batch_size,1,repr_size)
         token_attn_value = torch.bmm(token_attn_param, token_rnn_output).squeeze(1)  # (batch_size,max_len)
         token_attn_value = F.softmax(token_attn_value.masked_fill(token_mask == 0, -1e10), dim=1)  # 掩码 + softmax  (batch_size,max_len)
 
-        token_rnn_output=token_rnn_output.permute(0,2,1) # (batch_size,max_len,rep_size
-        token_attn_value=token_attn_value.unsqueeze(1) # (batch_size,1,max_len)
-        token_repr=torch.bmm(token_attn_value,token_rnn_output).squeeze(1) # (batch_size,rep_size)
+        token_rnn_output = token_rnn_output.permute(0, 2, 1)  # (batch_size,max_len,rep_size
+        token_attn_value = token_attn_value.unsqueeze(1)  # (batch_size,1,max_len)
+        token_repr = torch.bmm(token_attn_value, token_rnn_output).squeeze(1)  # (batch_size,rep_size)
 
         # 处理ast
         ast_rnn_output = self.tree_linear(self.tree_encoder(asts)).permute(0, 2, 1)
-        ast_attn_param = self.tree_attn_param.repeat(batch_size).unsqueeze(1)
+        ast_attn_param = self.tree_attn_param.repeat(batch_size, 1).unsqueeze(1)
         ast_attn_value = torch.bmm(ast_attn_param, ast_rnn_output).squeeze(1)
         ast_attn_value = F.softmax(ast_attn_value.masked_fill(ast_mask == 0, -1e10), dim=1)
 
-        ast_rnn_output=ast_rnn_output.permute(0,2,1) # (batch_size,max_len,rep_size
-        ast_attn_value=ast_attn_value.unsqueeze(1) # (batch_size,1,max_len)
-        ast_repr=torch.bmm(ast_attn_value,ast_rnn_output).squeeze(1) # (batch_size,rep_size)
+        ast_rnn_output = ast_rnn_output.permute(0, 2, 1)  # (batch_size,max_len,rep_size
+        ast_attn_value = ast_attn_value.unsqueeze(1)  # (batch_size,1,max_len)
+        ast_repr = torch.bmm(ast_attn_value, ast_rnn_output).squeeze(1)  # (batch_size,rep_size)
 
-        #结合token以及ast向量
-        code_repr=self.combine_linear(torch.cat([token_repr,ast_repr],dim=1))
+        # 结合token以及ast向量
+        code_repr = self.combine_linear(torch.cat([token_repr, ast_repr], dim=1))
 
         return code_repr
-    
+
     # 对description进行编码
-    def desc_encode(self, desc, desc_len,desc_mask):
-        batch_size=desc.size(0)
-        desc_rnn_output=self.desc_linear(self.SeqEncoder(desc,desc_len)).permute(0, 2, 1) (batch_size,repr_size,max_len)
-        desc_attn_param = self.desc_attn_param.repeat(batch_size).unsqueeze(1)  # (batch_size,1,repr_size)
+    def desc_encode(self, desc, desc_len):
+        batch_size = desc.shape[0]
+        desc_mask=self.create_mask(desc_len)
+        desc_rnn_output = self.desc_linear(self.seq_encoder(desc, desc_len)).permute(0, 2, 1)  # (batch_size, repr_size, max_len)
+        desc_attn_param = self.desc_attn_param.repeat(batch_size, 1).unsqueeze(1)  # (batch_size,1,repr_size)
         desc_attn_value = torch.bmm(desc_attn_param, desc_rnn_output).squeeze(1)  # (batch_size,max_len)
-        desc_attn_value = F.softmax(desc_attn_value.masked_fill(desc_mask == 0, -1e10), dim=1)  # 掩码 + softmax  (batch_size,max_len)
+        desc_attn_value = F.softmax(desc_attn_value.masked_fill(desc_mask == 0, -1e10), dim=1)  # mask + softmax  (batch_size,max_len)
 
-        desc_rnn_output=desc_rnn_output.permute(0,2,1) # (batch_size,max_len,rep_size
-        desc_attn_value=desc_attn_value.unsqueeze(1) # (batch_size,1,max_len)
-        desc_repr=torch.bmm(desc_attn_value,desc_rnn_output).squeeze(1) # (batch_size,rep_size)
-
+        desc_rnn_output = desc_rnn_output.permute(0, 2, 1)  # (batch_size,max_len,rep_size
+        desc_attn_value = desc_attn_value.unsqueeze(1)  # (batch_size,1,max_len)
+        desc_repr = torch.bmm(desc_attn_value, desc_rnn_output).squeeze(1)  # (batch_size,rep_size)
 
         return desc_repr
 
-    
-    # 计算code vector 以及 description vector 的相似度
     def similarity(self, code_vec, desc_vec):
         """
         https://arxiv.org/pdf/1508.01585.pdf 
         """
-        assert self.conf['sim_measure'] in ['cos', 'poly', 'euc', 'sigmoid', 'gesd', 'aesd'], "invalid similarity measure"
-        if self.conf['sim_measure']=='cos':
+        assert self.sim_measure in ['cos', 'poly', 'euc', 'sigmoid', 'gesd', 'aesd'], "invalid similarity measure"
+        if self.sim_measure == 'cos':
             return F.cosine_similarity(code_vec, desc_vec)
-        elif self.conf['sim_measure']=='poly':
+        elif self.sim_measure == 'poly':
             return (0.5*torch.matmul(code_vec, desc_vec.t()).diag()+1)**2
-        elif self.conf['sim_measure']=='sigmoid':
+        elif self.sim_measure == 'sigmoid':
             return torch.tanh(torch.matmul(code_vec, desc_vec.t()).diag()+1)
-        elif self.conf['sim_measure'] in ['euc', 'gesd', 'aesd']:
-            euc_dist = torch.dist(code_vec, desc_vec, 2) # or torch.norm(code_vec-desc_vec,2)
+        elif self.sim_measure in ['euc', 'gesd', 'aesd']:
+            euc_dist = torch.dist(code_vec, desc_vec, 2)  # or torch.norm(code_vec-desc_vec,2)
             euc_sim = 1 / (1 + euc_dist)
-            if self.conf['sim_measure']=='euc': return euc_sim                
+            if self.sim_measure == 'euc':
+                return euc_sim
             sigmoid_sim = torch.sigmoid(torch.matmul(code_vec, desc_vec.t()).diag()+1)
-            if self.conf['sim_measure']=='gesd': 
+            if self.sim_measure == 'gesd':
                 return euc_sim * sigmoid_sim
-            elif self.conf['sim_measure']=='aesd':
+            elif self.sim_measure == 'aesd':
                 return 0.5*(euc_sim+sigmoid_sim)
-    
 
-    def forward(self, tokens, token_len, ast,ast_len, desc_anchor, desc_anchor_len, desc_neg, desc_neg_len):
-            def create_mask(src_lens):
-                max_len = max(src_lens)
-                mask = []
-                mask = np.array(mask)
+    def create_mask(self,src_lens):
+        max_len = max(src_lens)
+        mask = []
+        mask = np.array(mask)
 
-                for i in range(len(src_lens)):
-                    row = np.concatenate(
-                        (np.ones(src_lens[i]), np.zeros(max_len - src_lens[i])))
-                    mask = np.concatenate((mask, row))
+        for i in range(len(src_lens)):
+            row = np.concatenate(
+                (np.ones(src_lens[i]), np.zeros(max_len - src_lens[i])))
+            mask = np.concatenate((mask, row))
 
-                mask = mask.reshape(len(src_lens), max_len)
+        mask = mask.reshape(len(src_lens), max_len)
 
-                return torch.from_numpy(mask).cuda()
-            
-            # 计算mask
-            token_mask=create_mask(token_len)
-            ast_mask=create_mask(ast_len)
-            desc_anchor_mask=create_mask(desc_anchor_len)
-            desc_neg_mask=create_mask(desc_neg_len)
+        return torch.from_numpy(mask).cuda()
 
-            #计算各部分的向量表示
-            code_repr=self.code_encode(tokens,token_len,token_mask,ast,ast_mask)
-            desc_anchor_repr=self.desc_encode(desc_anchor,desc_anchor_len,desc_anchor_mask)
-            desc_neg_repr=self.desc_encode(desc_neg,desc_neg_len,desc_neg_mask)
+    def forward(self, tokens, token_len, ast, ast_len, desc_anchor, desc_anchor_len, desc_neg, desc_neg_len):
 
-            # 计算相似度
-            anchor_sim = self.similarity(code_repr, desc_anchor_repr)
-            neg_sim = self.similarity(code_repr, desc_neg_repr) # [batch_sz x 1]
+        # 计算各部分的向量表示
+        code_repr = self.code_encode(tokens, token_len, ast, ast_len)
+        desc_anchor_repr = self.desc_encode(desc_anchor, desc_anchor_len)
+        desc_neg_repr = self.desc_encode(desc_neg, desc_neg_len)
 
-            loss=(self.margin-anchor_sim+neg_sim).clamp(min=1e-6).mean()
-            return loss
+        # 计算相似度
+        anchor_sim = self.similarity(code_repr, desc_anchor_repr)
+        neg_sim = self.similarity(code_repr, desc_neg_repr)  # [batch_sz x 1]
 
-
-            
-            
-
-        
-
-
-
-
-
-
-
-
-
-
+        loss = (self.margin-anchor_sim+neg_sim).clamp(min=1e-6).mean()
+        return loss
