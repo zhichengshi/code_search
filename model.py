@@ -25,7 +25,7 @@ class BatchTreeEncoder(nn.Module):
         # pretrained  embedding
         if pretrained_weight is not None:
             self.embedding.weight.data.copy_(torch.from_numpy(pretrained_weight))
-            # self.embedding.weight.requires_grad = False
+            self.embedding.weight.requires_grad = True
 
     def create_tensor(self, tensor):
         if self.use_gpu:
@@ -102,7 +102,7 @@ class TreeEncoder(nn.Module):
                              batch_first=True)
         # hidden
         self.hidden = self.init_hidden()
-        self.dropout = nn.Dropout(0.2)
+        self.dropout = nn.Dropout(0.1)
 
     def init_hidden(self):
         if self.gpu:
@@ -171,7 +171,7 @@ class SeqEncoder(nn.Module):
     def forward(self, inputs, input_lens=None):
         (batch_size, seq_len) = inputs.shape
         inputs = self.embedding(Variable(self.th.LongTensor(inputs)).cuda())  # input: [batch_sz x seq_len]  embedded: [batch_sz x seq_len x emb_sz]
-        inputs = F.dropout(inputs, 0.25, self.training)
+        inputs = F.dropout(inputs, 0.1, self.training)
         input_lens = Variable(self.th.LongTensor(input_lens)).cuda()
 
         if input_lens is not None:  # sort and pack sequence
@@ -184,7 +184,7 @@ class SeqEncoder(nn.Module):
         if input_lens is not None:  # reorder and pad
             _, inv_indices = indices.sort()
             output, lens = pad_packed_sequence(output, batch_first=True)
-            output = F.dropout(output, p=0.25, training=self.training)
+            output = F.dropout(output, p=0.1, training=self.training)
             output = output.index_select(0, inv_indices)
 
         return output   # bach_size, seq_len,  n_dirs * hidden_size
@@ -199,9 +199,11 @@ class JointEncoderWithAttention(nn.Module):
 
         self.sim_measure = sim_measure
         self.margin=margin
-        # 基于树以及线性结构的网络
+        # 构造三个编码器
         self.tree_encoder = TreeEncoder(embed_size, rnn_hidden_size, vocab_size, tree_embed_size, batch_size, use_gpu, pretrained_weight)
-        self.seq_encoder = SeqEncoder(vocab_size, embed_size, rnn_hidden_size, pretrained_weight)
+        self.token_encoder = SeqEncoder(vocab_size, embed_size, rnn_hidden_size, pretrained_weight)
+        self.desc_encoder = SeqEncoder(vocab_size, embed_size, rnn_hidden_size, pretrained_weight)
+        
 
         # 不同网络的线性映射
         self.tree_linear = nn.Linear(2*rnn_hidden_size, code_ast_repr_size)
@@ -216,7 +218,7 @@ class JointEncoderWithAttention(nn.Module):
 
     # 初始化模型参数
     def init_weights(self):
-        for linear in [self.tree_linear, self.token_linear, self.desc_linear]:
+        for linear in [self.tree_linear, self.token_linear,self.combine_linear, self.desc_linear]:
             linear.weight.data.uniform_(-0.1, 0.1)  # nn.init.xavier_normal_(m.weight)
             nn.init.constant_(linear.bias, 0.)
 
@@ -226,7 +228,7 @@ class JointEncoderWithAttention(nn.Module):
         token_mask=self.create_mask(token_len)
         ast_mask=self.create_mask(ast_len)
         # 处理code_token
-        token_rnn_output = self.token_linear(self.seq_encoder(tokens, token_len)).permute(0, 2, 1)  # (batch_size,repr_size,max_len)
+        token_rnn_output = self.token_linear(self.token_encoder(tokens, token_len)).permute(0, 2, 1)  # (batch_size,repr_size,max_len)
         token_attn_param = self.token_attn_param.repeat(batch_size, 1).unsqueeze(1)  # (batch_size,1,repr_size)
         token_attn_value = torch.bmm(token_attn_param, token_rnn_output).squeeze(1)  # (batch_size,max_len)
         token_attn_value = F.softmax(token_attn_value.masked_fill(token_mask == 0, -1e10), dim=1)  # 掩码 + softmax  (batch_size,max_len)
@@ -254,7 +256,7 @@ class JointEncoderWithAttention(nn.Module):
     def desc_encode(self, desc, desc_len):
         batch_size = desc.shape[0]
         desc_mask=self.create_mask(desc_len)
-        desc_rnn_output = self.desc_linear(self.seq_encoder(desc, desc_len)).permute(0, 2, 1)  # (batch_size, repr_size, max_len)
+        desc_rnn_output = self.desc_linear(self.desc_encoder(desc, desc_len)).permute(0, 2, 1)  # (batch_size, repr_size, max_len)
         desc_attn_param = self.desc_attn_param.repeat(batch_size, 1).unsqueeze(1)  # (batch_size,1,repr_size)
         desc_attn_value = torch.bmm(desc_attn_param, desc_rnn_output).squeeze(1)  # (batch_size,max_len)
         desc_attn_value = F.softmax(desc_attn_value.masked_fill(desc_mask == 0, -1e10), dim=1)  # mask + softmax  (batch_size,max_len)
